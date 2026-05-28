@@ -13,6 +13,7 @@ import logging
 from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import IdempotencyKey
@@ -86,7 +87,13 @@ async def check_and_lock(
         expires_at=expires,
     )
     db.add(record)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise IdempotencyConflictError(
+            "Request with this idempotency key is already in progress."
+        ) from exc
     return True, None
 
 

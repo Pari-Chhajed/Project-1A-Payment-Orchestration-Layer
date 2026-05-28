@@ -73,7 +73,8 @@ VALID_TRANSITIONS: dict[TransactionState, list[TransactionState]] = {
                                            TransactionState.DISPUTE_OPENED, TransactionState.RECONCILIATION_MISMATCH],
     TransactionState.PARTIALLY_CAPTURED:  [TransactionState.CAPTURE_INITIATED, TransactionState.REFUND_INITIATED,
                                            TransactionState.VOID_INITIATED, TransactionState.SETTLED],
-    TransactionState.CAPTURE_FAILED:      [TransactionState.CAPTURE_INITIATED, TransactionState.VOID_INITIATED, TransactionState.FAILED],
+    TransactionState.CAPTURE_FAILED:      [TransactionState.CAPTURE_INITIATED, TransactionState.CAPTURED,
+                                           TransactionState.VOID_INITIATED, TransactionState.FAILED],
     TransactionState.VOID_INITIATED:      [TransactionState.VOIDED, TransactionState.FAILED],
     TransactionState.VOIDED:              [],
     TransactionState.REFUND_INITIATED:    [TransactionState.REFUNDED, TransactionState.PARTIALLY_REFUNDED, TransactionState.REFUND_FAILED],
@@ -96,6 +97,7 @@ TERMINAL_STATES = {
 
 REFUNDABLE_STATES = {
     TransactionState.CAPTURED, TransactionState.PARTIALLY_CAPTURED, TransactionState.SETTLED,
+    TransactionState.PARTIALLY_REFUNDED,
 }
 
 # Default routing weights (must sum to 1.0)

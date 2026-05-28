@@ -99,13 +99,16 @@ async def record_failure(db: AsyncSession, gateway: GatewayName, payment_method:
     await db.flush()
 
 
-async def get_health_score(db: AsyncSession, gateway: GatewayName) -> float:
+async def get_health_score(db: AsyncSession, gateway: GatewayName, payment_method: str = "all") -> float:
     """1.0=healthy, 0.5=degraded(HALF_OPEN), 0.0=down(OPEN)"""
-    allowed = await is_allowed(db, gateway)
+    allowed = await is_allowed(db, gateway, payment_method)
     if not allowed:
         return 0.0
     result = await db.execute(
-        select(CircuitBreakerState).where(CircuitBreakerState.gateway == gateway.value)
+        select(CircuitBreakerState).where(
+            CircuitBreakerState.gateway == gateway.value,
+            CircuitBreakerState.payment_method == payment_method,
+        )
     )
     cb = result.scalar_one_or_none()
     if cb and cb.state == CircuitState.HALF_OPEN.value:

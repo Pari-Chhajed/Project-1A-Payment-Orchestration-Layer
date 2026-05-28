@@ -11,10 +11,11 @@ from app.config.constants import GatewayName
 from app.config.database import get_db
 from app.middleware.auth import make_error_response
 from app.models.models import (
-    GatewayHealthMetric, ReconciliationRun, RoutingConfig, Transaction,
+    GatewayHealthMetric, ReconciliationRun, RoutingConfig, Transaction, WebhookQueue,
 )
 from app.services import circuit_breaker as cb_svc
 from app.services import gateway_router
+from app.services import rate_limiter
 from app.services import reconciliation_service as recon_svc
 
 # ─────────────────────────────────────────────────────────────────
@@ -97,6 +98,11 @@ async def gateway_metrics(name: str, db: AsyncSession = Depends(get_db)):
             for r in rows
         ]
     }
+
+
+@gateways_router.get("/rate-limits/status")
+async def gateway_rate_limits(db: AsyncSession = Depends(get_db)):
+    return {"data": await rate_limiter.get_states(db)}
 
 
 class GatewayConfigUpdate(BaseModel):
@@ -202,6 +208,30 @@ async def list_reconciliation_reports(db: AsyncSession = Depends(get_db)):
                 "anomalies_found": r.anomalies_found,
             }
             for r in runs
+        ]
+    }
+
+
+@reconciliation_router.get("/webhook-dlq")
+async def webhook_dlq(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(WebhookQueue)
+        .where(WebhookQueue.status == "DLQ")
+        .order_by(WebhookQueue.created_at.desc())
+        .limit(100)
+    )
+    rows = result.scalars().all()
+    return {
+        "data": [
+            {
+                "id": row.id,
+                "gateway": row.gateway,
+                "event_id": row.event_id,
+                "retry_count": row.retry_count,
+                "error_message": row.error_message,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in rows
         ]
     }
 

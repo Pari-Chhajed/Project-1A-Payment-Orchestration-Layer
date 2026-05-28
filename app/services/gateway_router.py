@@ -92,8 +92,8 @@ async def select_gateway(
     MIN_LAT, MAX_LAT = 100, 2000
 
     for gateway in GatewayName:
-        health = await cb_svc.get_health_score(db, gateway)
-        cb_allowed = await cb_svc.is_allowed(db, gateway)
+        health = await cb_svc.get_health_score(db, gateway, payment_method.value)
+        cb_allowed = await cb_svc.is_allowed(db, gateway, payment_method.value)
 
         if not cb_allowed:
             continue
@@ -112,7 +112,10 @@ async def select_gateway(
 
         from app.models.models import CircuitBreakerState
         cb_result = await db.execute(
-            select(CircuitBreakerState).where(CircuitBreakerState.gateway == gateway.value)
+            select(CircuitBreakerState).where(
+                CircuitBreakerState.gateway == gateway.value,
+                CircuitBreakerState.payment_method == payment_method.value,
+            )
         )
         cb_row = cb_result.scalar_one_or_none()
         cb_state_label = cb_row.state if cb_row else "CLOSED"

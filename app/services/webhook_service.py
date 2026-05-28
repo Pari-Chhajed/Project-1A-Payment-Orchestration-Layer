@@ -9,13 +9,14 @@ Webhook Processing Pipeline
 """
 import json
 import logging
+from datetime import datetime, timezone, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.constants import GatewayName, TransactionState
 from app.config.settings import settings
-from app.models.models import ProcessedWebhookEvent, SecurityAuditLog, Transaction
+from app.models.models import ProcessedWebhookEvent, SecurityAuditLog, Transaction, WebhookQueue
 from app.services import state_machine as sm
 from app.utils.crypto import (
     hash_payload, verify_payu_signature,
@@ -81,6 +82,46 @@ async def _log_security_event(db: AsyncSession, event_type: str, gateway: str,
         await db.flush()
     except Exception as e:
         logger.error("Failed to write security audit log: %s", e)
+
+
+async def _enqueue_webhook(
+    db: AsyncSession,
+    gateway: GatewayName,
+    event_id: str,
+    payload: dict,
+    raw_body: str,
+    signature: str,
+) -> WebhookQueue:
+    item = WebhookQueue(
+        gateway=gateway.value,
+        event_id=event_id,
+        payload=payload,
+        raw_body=raw_body,
+        signature=signature,
+        status="PENDING",
+        max_retries=settings.WEBHOOK_MAX_RETRIES,
+    )
+    db.add(item)
+    await db.flush()
+    return item
+
+
+async def _complete_queue_item(db: AsyncSession, item: WebhookQueue) -> None:
+    item.status = "COMPLETED"
+    item.processed_at = datetime.now(timezone.utc)
+    await db.flush()
+
+
+async def _fail_queue_item(db: AsyncSession, item: WebhookQueue, exc: Exception) -> None:
+    item.retry_count += 1
+    item.error_message = str(exc)
+    if item.retry_count >= item.max_retries:
+        item.status = "DLQ"
+    else:
+        item.status = "RETRY"
+        delay = settings.WEBHOOK_RETRY_BASE_SECONDS ** item.retry_count
+        item.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    await db.flush()
 
 
 async def _process(
@@ -210,8 +251,15 @@ async def process_razorpay(db: AsyncSession, raw_body: str, signature: str, sour
     payment_id: str = entity.get("id", "")
     order_id: str = entity.get("order_id", "")
     event_id = f"{event_type}_{payment_id}"
-    return await _process(db, GatewayName.RAZORPAY, event_id, event_type, raw_body,
-                          RAZORPAY_MAP, payment_id, order_id, entity, source_ip)
+    queue_item = await _enqueue_webhook(db, GatewayName.RAZORPAY, event_id, payload, raw_body, signature)
+    try:
+        result = await _process(db, GatewayName.RAZORPAY, event_id, event_type, raw_body,
+                                RAZORPAY_MAP, payment_id, order_id, entity, source_ip)
+        await _complete_queue_item(db, queue_item)
+        return result
+    except Exception as exc:
+        await _fail_queue_item(db, queue_item, exc)
+        raise
 
 
 async def process_stripe(db: AsyncSession, raw_body: str, stripe_header: str, source_ip: str) -> dict:
@@ -225,8 +273,15 @@ async def process_stripe(db: AsyncSession, raw_body: str, stripe_header: str, so
     event_type: str = payload.get("type", "")
     data_obj = payload.get("data", {}).get("object", {})
     gateway_id: str = data_obj.get("id", "")
-    return await _process(db, GatewayName.STRIPE, event_id, event_type, raw_body,
-                          STRIPE_MAP, gateway_id, gateway_id, data_obj, source_ip)
+    queue_item = await _enqueue_webhook(db, GatewayName.STRIPE, event_id, payload, raw_body, stripe_header)
+    try:
+        result = await _process(db, GatewayName.STRIPE, event_id, event_type, raw_body,
+                                STRIPE_MAP, gateway_id, gateway_id, data_obj, source_ip)
+        await _complete_queue_item(db, queue_item)
+        return result
+    except Exception as exc:
+        await _fail_queue_item(db, queue_item, exc)
+        raise
 
 
 async def process_payu(db: AsyncSession, raw_body: str, source_ip: str) -> dict:
@@ -240,8 +295,15 @@ async def process_payu(db: AsyncSession, raw_body: str, source_ip: str) -> dict:
     event_type = payload.get("status", "unknown")
     gateway_ref = payload.get("mihpayid") or payload.get("txnid", "")
     event_id = f"{payload.get('txnid', '')}_{event_type}"
-    return await _process(db, GatewayName.PAYU, event_id, event_type, raw_body,
-                          PAYU_MAP, gateway_ref, payload.get("txnid", ""), payload, source_ip)
+    queue_item = await _enqueue_webhook(db, GatewayName.PAYU, event_id, payload, raw_body, received_hash)
+    try:
+        result = await _process(db, GatewayName.PAYU, event_id, event_type, raw_body,
+                                PAYU_MAP, gateway_ref, payload.get("txnid", ""), payload, source_ip)
+        await _complete_queue_item(db, queue_item)
+        return result
+    except Exception as exc:
+        await _fail_queue_item(db, queue_item, exc)
+        raise
 
 
 async def process_upi(db: AsyncSession, raw_body: str, signature: str, source_ip: str) -> dict:
@@ -254,5 +316,12 @@ async def process_upi(db: AsyncSession, raw_body: str, signature: str, source_ip
     event_type: str = payload.get("status", "UNKNOWN")
     gateway_ref: str = payload.get("txnRefNum") or payload.get("upiTransactionId", "")
     event_id = f"{gateway_ref}_{event_type}"
-    return await _process(db, GatewayName.UPI, event_id, event_type, raw_body,
-                          UPI_MAP, gateway_ref, gateway_ref, payload, source_ip)
+    queue_item = await _enqueue_webhook(db, GatewayName.UPI, event_id, payload, raw_body, signature)
+    try:
+        result = await _process(db, GatewayName.UPI, event_id, event_type, raw_body,
+                                UPI_MAP, gateway_ref, gateway_ref, payload, source_ip)
+        await _complete_queue_item(db, queue_item)
+        return result
+    except Exception as exc:
+        await _fail_queue_item(db, queue_item, exc)
+        raise

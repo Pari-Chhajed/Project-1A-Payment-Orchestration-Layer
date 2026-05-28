@@ -8,9 +8,21 @@ logger = logging.getLogger(__name__)
 
 async def api_key_middleware(request: Request, call_next):
     # Skip auth for health and webhook endpoints
-    if request.url.path in ("/api/v1/health", "/") or request.url.path.startswith("/api/v1/webhooks"):
-        return await call_next(request)
+    EXCLUDED_PATHS = {
+        "/",
+        "/docs",
+        "/openapi.json",
+        "/redoc",
+        "/favicon.ico",
+        "/api/v1/health",
+    }
 
+    if (
+        request.url.path in EXCLUDED_PATHS
+        or request.url.path.startswith("/api/v1/webhooks")
+    ):
+        return await call_next(request)
+    
     key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
     if not key or key != settings.API_KEY:
         return JSONResponse(

@@ -192,6 +192,16 @@ class RoutingConfig(Base):
     updated_at:   Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
 
 
+class GatewayRateLimitState(Base):
+    __tablename__ = "gateway_rate_limit_state"
+
+    gateway:           Mapped[str]      = mapped_column(String(50), primary_key=True)
+    capacity:          Mapped[int]      = mapped_column(Integer, nullable=False)
+    refill_per_second: Mapped[int]      = mapped_column(Integer, nullable=False)
+    available_tokens:  Mapped[float]    = mapped_column(Float, nullable=False)
+    updated_at:        Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
 # ─────────────────────────────────────────────────────────────────
 # REFUNDS
 # ─────────────────────────────────────────────────────────────────

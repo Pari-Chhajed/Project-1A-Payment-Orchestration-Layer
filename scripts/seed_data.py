@@ -6,8 +6,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.database import AsyncSessionLocal
-from app.config.constants import DEFAULT_WEIGHTS, GatewayName
-from app.models.models import CircuitBreakerState, GatewayHealthMetric, RoutingConfig
+from app.config.constants import DEFAULT_WEIGHTS, GATEWAY_METHODS, GatewayName
+from app.config.settings import settings
+from app.models.models import CircuitBreakerState, GatewayHealthMetric, GatewayRateLimitState, RoutingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ async def seed_database():
         try:
             await _seed_routing_config(db)
             await _seed_circuit_breakers(db)
+            await _seed_rate_limits(db)
             await _seed_historical_metrics(db)
             await db.commit()
             logger.info("Database seeded successfully")
@@ -58,19 +60,37 @@ async def _seed_routing_config(db: AsyncSession):
 
 async def _seed_circuit_breakers(db: AsyncSession):
     for gw in GatewayName:
-        existing = await db.execute(
-            select(CircuitBreakerState).where(
-                CircuitBreakerState.gateway == gw.value,
-                CircuitBreakerState.payment_method == "all",
+        methods = {method.value for method in GATEWAY_METHODS[gw]} | {"all"}
+        for method in methods:
+            existing = await db.execute(
+                select(CircuitBreakerState).where(
+                    CircuitBreakerState.gateway == gw.value,
+                    CircuitBreakerState.payment_method == method,
+                )
             )
+            if not existing.scalar_one_or_none():
+                db.add(CircuitBreakerState(
+                    gateway=gw.value,
+                    payment_method=method,
+                    state="CLOSED",
+                    failure_threshold=5,
+                    timeout_seconds=30,
+                ))
+    await db.flush()
+
+
+async def _seed_rate_limits(db: AsyncSession):
+    for gw in GatewayName:
+        existing = await db.execute(
+            select(GatewayRateLimitState).where(GatewayRateLimitState.gateway == gw.value)
         )
         if not existing.scalar_one_or_none():
-            db.add(CircuitBreakerState(
+            capacity = settings.GATEWAY_RATE_LIMIT_PER_SECOND
+            db.add(GatewayRateLimitState(
                 gateway=gw.value,
-                payment_method="all",
-                state="CLOSED",
-                failure_threshold=5,
-                timeout_seconds=30,
+                capacity=capacity,
+                refill_per_second=capacity,
+                available_tokens=float(capacity),
             ))
     await db.flush()
 

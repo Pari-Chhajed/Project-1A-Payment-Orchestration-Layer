@@ -53,6 +53,8 @@ async def create_payment(
     x_mock_response: Optional[str] = Header(None, alias="X-Mock-Response"),
     x_mock_delay_ms: Optional[int] = Header(None, alias="X-Mock-Delay-Ms"),
     x_mock_gateway: Optional[str] = Header(None, alias="X-Mock-Gateway"),
+    x_mock_gateway_down: Optional[str] = Header(None, alias="X-Mock-Gateway-Down"),
+    x_merchant_id: Optional[str] = Header("payflow_default", alias="X-Merchant-Id"),
 ):
     if not idempotency_key:
         return make_error_response("MISSING_IDEMPOTENCY_KEY", "Idempotency-Key header is required", 400)
@@ -60,7 +62,7 @@ async def create_payment(
     try:
         result = await svc.create_payment(
             db=db,
-            merchant_id="payflow_default",
+            merchant_id=x_merchant_id or "payflow_default",
             merchant_order_id=body.merchant_order_id,
             amount_paise=body.amount,
             currency=body.currency,
@@ -69,7 +71,7 @@ async def create_payment(
             idempotency_key=idempotency_key,
             description=body.description,
             meta=body.metadata,
-            mock_response=x_mock_response,
+            mock_response="gateway-down" if x_mock_gateway_down == "true" else x_mock_response,
             mock_delay_ms=x_mock_delay_ms,
             mock_gateway=x_mock_gateway,
         )
@@ -104,12 +106,13 @@ async def get_payment(payment_id: str, db: AsyncSession = Depends(get_db)):
 async def list_payments(
     merchant_order_id: Optional[str] = None,
     state: Optional[str] = None,
+    x_merchant_id: Optional[str] = Header("payflow_default", alias="X-Merchant-Id"),
     db: AsyncSession = Depends(get_db),
 ):
     from sqlalchemy import select
     from app.models.models import Transaction
 
-    q = select(Transaction).where(Transaction.merchant_id == "payflow_default")
+    q = select(Transaction).where(Transaction.merchant_id == (x_merchant_id or "payflow_default"))
     if merchant_order_id:
         q = q.where(Transaction.merchant_order_id == merchant_order_id)
     if state:
@@ -144,6 +147,8 @@ async def capture_payment(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     x_mock_response: Optional[str] = Header(None, alias="X-Mock-Response"),
 ):
+    if not idempotency_key:
+        return make_error_response("MISSING_IDEMPOTENCY_KEY", "Idempotency-Key header is required", 400)
     try:
         result = await svc.capture_payment(db, payment_id, body.amount_paise, idempotency_key, x_mock_response)
         return {"data": result}
@@ -171,6 +176,8 @@ async def refund_payment(
     db: AsyncSession = Depends(get_db),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    if not idempotency_key:
+        return make_error_response("MISSING_IDEMPOTENCY_KEY", "Idempotency-Key header is required", 400)
     try:
         result = await svc.refund_payment(db, payment_id, body.amount_paise, body.reason, idempotency_key)
         return {"data": result}
