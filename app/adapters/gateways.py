@@ -10,6 +10,7 @@ X-Mock-Response header: success | timeout | server-error | decline | rate-limit
 import asyncio
 import uuid
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Optional
 
 
@@ -39,14 +40,18 @@ def _uid(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:14]}"
 
 
+def _paise_decimal(amount_paise: int) -> str:
+    return str((Decimal(amount_paise) / Decimal("100")).quantize(Decimal("0.01")))
+
+
 async def _mock(mock_response: str | None, mock_delay_ms: int | None, success: GatewayResponse) -> GatewayResponse:
     delay = (mock_delay_ms or 0) / 1000
     if delay > 0:
         await asyncio.sleep(delay)
 
     if mock_response == "timeout":
-        await asyncio.sleep(99)  # will be interrupted by timeout
-        raise TimeoutError("Gateway timeout")
+        await asyncio.sleep(0.2)
+        raise asyncio.TimeoutError("Gateway timeout")
     if mock_response == "server-error":
         return GatewayResponse(success=False, error_code="SERVER_ERROR",
                                error_message="Gateway internal error (502)",
@@ -175,7 +180,7 @@ async def payu_authorise(order_id: str, amount_paise: int, currency: str,
         success=True, gateway_order_id=txn_id, gateway_payment_id=txn_id,
         status="success", amount_paise=amount_paise, currency=currency,
         raw_response={"txnid": txn_id, "status": "success",
-                      "amount": f"{amount_paise/100:.2f}"},
+                      "amount": _paise_decimal(amount_paise)},
     ))
 
 
@@ -195,6 +200,14 @@ async def payu_fetch_status(gateway_payment_id: str) -> PaymentStatusResponse:
                                   raw_response={"txnid": gateway_payment_id, "status": "success"})
 
 
+async def payu_capture(gateway_payment_id: str, amount_paise: int,
+                       mock_response: str | None = None) -> GatewayResponse:
+    return await _mock(mock_response, None, GatewayResponse(
+        success=True, gateway_payment_id=gateway_payment_id, status="captured",
+        amount_paise=amount_paise, raw_response={"status": "captured", "amount": amount_paise},
+    ))
+
+
 # ─────────────────────────────────────────────────────────────────
 # UPI  (instant — no auth+capture phase)
 # ─────────────────────────────────────────────────────────────────
@@ -207,7 +220,7 @@ async def upi_authorise(order_id: str, amount_paise: int, currency: str,
         success=True, gateway_order_id=txn_ref, gateway_payment_id=txn_ref,
         status="pending", amount_paise=amount_paise, currency="INR",
         raw_response={"txnRefNum": txn_ref, "status": "PENDING",
-                      "amount": f"{amount_paise/100:.2f}"},
+                      "amount": _paise_decimal(amount_paise)},
     ))
 
 
@@ -215,6 +228,34 @@ async def upi_fetch_status(gateway_payment_id: str) -> PaymentStatusResponse:
     return PaymentStatusResponse(gateway_payment_id=gateway_payment_id,
                                   status="captured",
                                   raw_response={"txnRefNum": gateway_payment_id, "status": "SUCCESS"})
+
+
+async def upi_capture(gateway_payment_id: str, amount_paise: int,
+                      mock_response: str | None = None) -> GatewayResponse:
+    return GatewayResponse(
+        success=False,
+        error_code="NOT_SUPPORTED",
+        error_message="UPI does not support separate capture",
+        raw_response={},
+    )
+
+
+async def upi_refund(gateway_payment_id: str, amount_paise: int,
+                     mock_response: str | None = None) -> GatewayResponse:
+    return GatewayResponse(
+        success=False,
+        error_code="NOT_SUPPORTED",
+        error_message="UPI refunds processed via NPCI portal",
+        raw_response={},
+    )
+
+
+async def payu_void(gateway_payment_id: str) -> GatewayResponse:
+    return GatewayResponse(success=True, raw_response={"status": "cancelled"})
+
+
+async def upi_void(gateway_payment_id: str) -> GatewayResponse:
+    return GatewayResponse(success=True, raw_response={"status": "EXPIRED"})
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -232,33 +273,22 @@ AUTHORISE_FN = {
 CAPTURE_FN = {
     GatewayName.RAZORPAY: razorpay_capture,
     GatewayName.STRIPE:   stripe_capture,
-    GatewayName.PAYU:     lambda gid, amt, mr=None: GatewayResponse(
-        success=True, gateway_payment_id=gid, status="captured",
-        raw_response={"status": "captured"},
-    ),
-    GatewayName.UPI: lambda gid, amt, mr=None: GatewayResponse(
-        success=False, error_code="NOT_SUPPORTED",
-        error_message="UPI does not support separate capture",
-        raw_response={},
-    ),
+    GatewayName.PAYU:     payu_capture,
+    GatewayName.UPI:      upi_capture,
 }
 
 REFUND_FN = {
     GatewayName.RAZORPAY: razorpay_refund,
     GatewayName.STRIPE:   stripe_refund,
     GatewayName.PAYU:     payu_refund,
-    GatewayName.UPI: lambda gid, amt, mr=None: GatewayResponse(
-        success=False, error_code="NOT_SUPPORTED",
-        error_message="UPI refunds processed via NPCI portal",
-        raw_response={},
-    ),
+    GatewayName.UPI:      upi_refund,
 }
 
 VOID_FN = {
     GatewayName.RAZORPAY: razorpay_void,
     GatewayName.STRIPE:   stripe_void,
-    GatewayName.PAYU:     lambda gid: GatewayResponse(success=True, raw_response={"status": "cancelled"}),
-    GatewayName.UPI:      lambda gid: GatewayResponse(success=True, raw_response={"status": "EXPIRED"}),
+    GatewayName.PAYU:     payu_void,
+    GatewayName.UPI:      upi_void,
 }
 
 FETCH_FN = {

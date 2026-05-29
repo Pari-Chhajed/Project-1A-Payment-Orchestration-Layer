@@ -40,6 +40,7 @@ class Transaction(Base):
     currency:               Mapped[str]            = mapped_column(String(3), nullable=False, default="INR")
     captured_amount_paise:  Mapped[int]            = mapped_column(BigInteger, default=0)
     refunded_amount_paise:  Mapped[int]            = mapped_column(BigInteger, default=0)
+    hold_amount_paise:      Mapped[int]            = mapped_column(BigInteger, default=0)
     customer_id:            Mapped[Optional[str]]  = mapped_column(String(255))
     customer_email:         Mapped[Optional[str]]  = mapped_column(String(255))
     customer_phone:         Mapped[Optional[str]]  = mapped_column(String(20))
@@ -53,6 +54,7 @@ class Transaction(Base):
 
     state_logs:   Mapped[list["TransactionStateLog"]] = relationship("TransactionStateLog", back_populates="transaction", lazy="select")
     refunds:      Mapped[list["Refund"]]               = relationship("Refund", back_populates="transaction", lazy="select")
+    payment_attempts: Mapped[list["PaymentAttempt"]]    = relationship("PaymentAttempt", back_populates="transaction", lazy="select")
 
     __table_args__ = (
         UniqueConstraint("merchant_id", "merchant_order_id", name="uq_merchant_order"),
@@ -61,6 +63,67 @@ class Transaction(Base):
         Index("idx_txn_created", "created_at"),
         Index("idx_txn_gateway_ref", "gateway_reference"),
         Index("idx_txn_trace", "trace_id"),
+        Index("idx_txn_merchant_state_updated", "merchant_id", "state", "updated_at"),
+    )
+
+
+class PaymentAttempt(Base):
+    __tablename__ = "payment_attempts"
+
+    id:                 Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    transaction_id:     Mapped[str] = mapped_column(String(36), ForeignKey("transactions.id"), nullable=False)
+    operation_type:     Mapped[str] = mapped_column(String(50), nullable=False)
+    attempt_number:     Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    parent_attempt_id:  Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("payment_attempts.id"))
+    idempotency_key:    Mapped[Optional[str]] = mapped_column(String(255))
+    status:             Mapped[str] = mapped_column(String(30), nullable=False, default="PROCESSING")
+    amount_paise:       Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency:           Mapped[str] = mapped_column(String(3), nullable=False, default="INR")
+    next_retry_at:      Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    completed_at:       Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    error_code:         Mapped[Optional[str]] = mapped_column(String(100))
+    error_message:      Mapped[Optional[str]] = mapped_column(Text)
+    meta:               Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+    trace_id:           Mapped[Optional[str]] = mapped_column(String(36))
+    created_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+    transaction: Mapped["Transaction"] = relationship("Transaction", back_populates="payment_attempts")
+    gateway_attempts: Mapped[list["GatewayAttempt"]] = relationship("GatewayAttempt", back_populates="payment_attempt", lazy="select")
+
+    __table_args__ = (
+        UniqueConstraint("transaction_id", "operation_type", "attempt_number", name="uq_payment_attempt_lineage"),
+        Index("idx_payment_attempt_txn", "transaction_id"),
+        Index("idx_payment_attempt_status_retry", "status", "next_retry_at"),
+    )
+
+
+class GatewayAttempt(Base):
+    __tablename__ = "gateway_attempts"
+
+    id:                 Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    payment_attempt_id: Mapped[str] = mapped_column(String(36), ForeignKey("payment_attempts.id"), nullable=False)
+    transaction_id:     Mapped[str] = mapped_column(String(36), ForeignKey("transactions.id"), nullable=False)
+    gateway:            Mapped[str] = mapped_column(String(50), nullable=False)
+    attempt_number:     Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status:             Mapped[str] = mapped_column(String(30), nullable=False, default="PROCESSING")
+    gateway_order_id:   Mapped[Optional[str]] = mapped_column(String(255))
+    gateway_reference:  Mapped[Optional[str]] = mapped_column(String(255))
+    request_hash:       Mapped[Optional[str]] = mapped_column(String(64))
+    response_code:      Mapped[Optional[str]] = mapped_column(String(50))
+    response_body:      Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+    error_code:         Mapped[Optional[str]] = mapped_column(String(100))
+    error_message:      Mapped[Optional[str]] = mapped_column(Text)
+    latency_ms:         Mapped[int] = mapped_column(Integer, default=0)
+    started_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    completed_at:       Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    payment_attempt: Mapped["PaymentAttempt"] = relationship("PaymentAttempt", back_populates="gateway_attempts")
+
+    __table_args__ = (
+        Index("idx_gateway_attempt_payment", "payment_attempt_id"),
+        Index("idx_gateway_attempt_txn_gateway", "transaction_id", "gateway"),
+        Index("idx_gateway_attempt_status", "status"),
     )
 
 
@@ -97,6 +160,7 @@ class IdempotencyKey(Base):
     __tablename__ = "idempotency_keys"
 
     merchant_id:    Mapped[str]            = mapped_column(String(100), primary_key=True, default="payflow_default")
+    operation_type: Mapped[str]            = mapped_column(String(50), primary_key=True, default="payment.create")
     key:            Mapped[str]            = mapped_column(String(255), primary_key=True)
     request_hash:   Mapped[str]            = mapped_column(String(64), nullable=False)
     status:         Mapped[str]            = mapped_column(String(20), default="PROCESSING")
@@ -106,6 +170,11 @@ class IdempotencyKey(Base):
     created_at:     Mapped[datetime]       = mapped_column(DateTime(timezone=True), default=now_utc)
     updated_at:     Mapped[datetime]       = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
     expires_at:     Mapped[datetime]       = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_idem_expires", "expires_at"),
+        Index("idx_idem_status", "status"),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -139,8 +208,38 @@ class WebhookQueue(Base):
     max_retries:   Mapped[int]           = mapped_column(Integer, default=3)
     next_retry_at: Mapped[datetime]      = mapped_column(DateTime(timezone=True), default=now_utc)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
+    locked_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    locked_by:     Mapped[Optional[str]] = mapped_column(String(100))
     created_at:    Mapped[datetime]      = mapped_column(DateTime(timezone=True), default=now_utc)
     processed_at:  Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("gateway", "event_id", name="uq_webhook_queue_event"),
+        Index("idx_webhook_queue_pending", "status", "next_retry_at"),
+    )
+
+
+class QueueMessage(Base):
+    __tablename__ = "queue_messages"
+
+    id:            Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    queue_name:    Mapped[str] = mapped_column(String(100), nullable=False)
+    message_type:  Mapped[str] = mapped_column(String(100), nullable=False)
+    payload:       Mapped[dict] = mapped_column(JSON, nullable=False)
+    status:        Mapped[str] = mapped_column(String(20), default="PENDING")
+    retry_count:   Mapped[int] = mapped_column(Integer, default=0)
+    max_retries:   Mapped[int] = mapped_column(Integer, default=3)
+    next_retry_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    locked_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    locked_by:     Mapped[Optional[str]] = mapped_column(String(100))
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    created_at:    Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    processed_at:  Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_queue_messages_pending", "queue_name", "status", "next_retry_at"),
+        Index("idx_queue_messages_type", "message_type"),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -244,6 +343,48 @@ class ReconciliationLog(Base):
     created_at:       Mapped[datetime]       = mapped_column(DateTime(timezone=True), default=now_utc)
 
 
+class SettlementBatch(Base):
+    __tablename__ = "settlement_batches"
+
+    id:                Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    gateway:           Mapped[str] = mapped_column(String(50), nullable=False)
+    settlement_date:   Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status:            Mapped[str] = mapped_column(String(30), default="PENDING")
+    total_amount_paise: Mapped[int] = mapped_column(BigInteger, default=0)
+    entry_count:       Mapped[int] = mapped_column(Integer, default=0)
+    raw_report:        Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+    created_at:        Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    completed_at:      Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    entries: Mapped[list["SettlementEntry"]] = relationship("SettlementEntry", back_populates="batch", lazy="select")
+
+    __table_args__ = (
+        Index("idx_settlement_batch_gateway_date", "gateway", "settlement_date"),
+    )
+
+
+class SettlementEntry(Base):
+    __tablename__ = "settlement_entries"
+
+    id:                 Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    batch_id:           Mapped[str] = mapped_column(String(36), ForeignKey("settlement_batches.id"), nullable=False)
+    transaction_id:     Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("transactions.id"))
+    gateway_reference:  Mapped[str] = mapped_column(String(255), nullable=False)
+    status:             Mapped[str] = mapped_column(String(30), nullable=False)
+    amount_paise:       Mapped[int] = mapped_column(BigInteger, nullable=False)
+    currency:           Mapped[str] = mapped_column(String(3), default="INR")
+    mismatch_type:      Mapped[Optional[str]] = mapped_column(String(100))
+    requires_manual:    Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at:         Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+    batch: Mapped["SettlementBatch"] = relationship("SettlementBatch", back_populates="entries")
+
+    __table_args__ = (
+        Index("idx_settlement_entry_txn", "transaction_id"),
+        Index("idx_settlement_entry_gateway_ref", "gateway_reference"),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────
 # SECURITY AUDIT LOG
 # ─────────────────────────────────────────────────────────────────
@@ -257,6 +398,35 @@ class SecurityAuditLog(Base):
     payload_hash: Mapped[Optional[str]]  = mapped_column(String(64))
     details:      Mapped[Optional[dict]] = mapped_column(JSON)
     created_at:   Mapped[datetime]       = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class Merchant(Base):
+    __tablename__ = "merchants"
+
+    id:          Mapped[str] = mapped_column(String(100), primary_key=True)
+    name:        Mapped[str] = mapped_column(String(255), nullable=False)
+    status:      Mapped[str] = mapped_column(String(30), default="ACTIVE")
+    created_at:  Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+    updated_at:  Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+class MerchantApiKey(Base):
+    __tablename__ = "merchant_api_keys"
+
+    id:              Mapped[str] = mapped_column(String(36), primary_key=True, default=new_uuid)
+    merchant_id:     Mapped[str] = mapped_column(String(100), ForeignKey("merchants.id"), nullable=False)
+    key_hash:        Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    key_prefix:      Mapped[str] = mapped_column(String(16), nullable=False)
+    scopes:          Mapped[list] = mapped_column(JSON, default=list)
+    status:          Mapped[str] = mapped_column(String(30), default="ACTIVE")
+    expires_at:      Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_used_at:    Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    rotated_from_id: Mapped[Optional[str]] = mapped_column(String(36))
+    created_at:      Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+    __table_args__ = (
+        Index("idx_api_key_merchant", "merchant_id"),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────

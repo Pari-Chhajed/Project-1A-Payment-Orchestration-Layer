@@ -7,7 +7,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.database import AsyncSessionLocal
 from app.config.constants import DEFAULT_WEIGHTS, GatewayName
-from app.models.models import CircuitBreakerState, GatewayHealthMetric, RoutingConfig
+from app.models.models import CircuitBreakerState, GatewayHealthMetric, Merchant, MerchantApiKey, RoutingConfig
+from app.config.settings import settings
+import hashlib
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ async def seed_database():
     async with AsyncSessionLocal() as db:
         try:
             await _seed_routing_config(db)
+            await _seed_default_merchant(db)
             await _seed_circuit_breakers(db)
             await _seed_historical_metrics(db)
             await db.commit()
@@ -53,6 +56,22 @@ async def _seed_routing_config(db: AsyncSession):
         if not existing.scalar_one_or_none():
             db.add(RoutingConfig(config_key=f"weight_{key}", config_value=value,
                                   description=f"Weight for {key} factor"))
+    await db.flush()
+
+
+async def _seed_default_merchant(db: AsyncSession):
+    merchant = await db.get(Merchant, "payflow_default")
+    if not merchant:
+        db.add(Merchant(id="payflow_default", name="PayFlow Default Merchant"))
+    key_hash = hashlib.sha256(settings.API_KEY.encode()).hexdigest()
+    existing = await db.execute(select(MerchantApiKey).where(MerchantApiKey.key_hash == key_hash))
+    if not existing.scalar_one_or_none():
+        db.add(MerchantApiKey(
+            merchant_id="payflow_default",
+            key_hash=key_hash,
+            key_prefix=settings.API_KEY[:8],
+            scopes=["payments:create", "payments:read", "refunds:create", "admin:read", "admin:write"],
+        ))
     await db.flush()
 
 

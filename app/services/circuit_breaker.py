@@ -16,8 +16,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config.constants import CircuitState, GatewayName
 from app.config.settings import settings
 from app.models.models import CircuitBreakerState
+from app.services.redis_client import get_redis
 
 logger = logging.getLogger(__name__)
+
+
+async def _mirror_to_redis(cb: CircuitBreakerState) -> None:
+    try:
+        redis = get_redis()
+        await redis.hset(
+            f"circuit:{cb.gateway}:{cb.payment_method}",
+            mapping={
+                "state": cb.state,
+                "failure_count": cb.failure_count,
+                "success_count": cb.success_count,
+                "updated_at": cb.updated_at.isoformat() if cb.updated_at else "",
+            },
+        )
+    except Exception:
+        logger.debug("Redis circuit breaker mirror unavailable", exc_info=True)
 
 
 async def _get_or_create(db: AsyncSession, gateway: str, payment_method: str = "all") -> CircuitBreakerState:
@@ -79,6 +96,7 @@ async def record_success(db: AsyncSession, gateway: GatewayName, payment_method:
     cb.last_success_at = datetime.now(timezone.utc)
     cb.updated_at = datetime.now(timezone.utc)
     await db.flush()
+    await _mirror_to_redis(cb)
 
 
 async def record_failure(db: AsyncSession, gateway: GatewayName, payment_method: str = "all") -> None:
@@ -97,6 +115,7 @@ async def record_failure(db: AsyncSession, gateway: GatewayName, payment_method:
         logger.error("Circuit breaker %s TRIPPED → OPEN (failures=%d)", gateway.value, cb.failure_count)
 
     await db.flush()
+    await _mirror_to_redis(cb)
 
 
 async def get_health_score(db: AsyncSession, gateway: GatewayName) -> float:
@@ -136,4 +155,5 @@ async def reset(db: AsyncSession, gateway: GatewayName) -> None:
     cb.opened_at = None
     cb.updated_at = datetime.now(timezone.utc)
     await db.flush()
+    await _mirror_to_redis(cb)
     logger.info("Circuit breaker %s manually reset → CLOSED", gateway.value)

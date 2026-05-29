@@ -12,7 +12,7 @@ import json
 import logging
 from datetime import datetime, timezone, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.models import IdempotencyKey
@@ -35,6 +35,7 @@ async def check_and_lock(
     merchant_id: str,
     key: str,
     request_body: dict,
+    operation_type: str = "payment.create",
 ) -> tuple[bool, dict | None]:
     """
     Returns (is_new, cached_response).
@@ -45,9 +46,16 @@ async def check_and_lock(
     request_hash = _hash_body(request_body)
     expires = datetime.now(timezone.utc) + timedelta(hours=24)
 
+    if db.bind and db.bind.dialect.name == "postgresql":
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"idem:{merchant_id}:{operation_type}:{key}"},
+        )
+
     result = await db.execute(
         select(IdempotencyKey).where(
             IdempotencyKey.merchant_id == merchant_id,
+            IdempotencyKey.operation_type == operation_type,
             IdempotencyKey.key == key,
         ).with_for_update()
     )
@@ -80,6 +88,7 @@ async def check_and_lock(
     # Insert new record with PROCESSING status
     record = IdempotencyKey(
         merchant_id=merchant_id,
+        operation_type=operation_type,
         key=key,
         request_hash=request_hash,
         status="PROCESSING",
@@ -97,10 +106,12 @@ async def mark_completed(
     transaction_id: str,
     response_code: int,
     response_body: dict,
+    operation_type: str = "payment.create",
 ) -> None:
     result = await db.execute(
         select(IdempotencyKey).where(
             IdempotencyKey.merchant_id == merchant_id,
+            IdempotencyKey.operation_type == operation_type,
             IdempotencyKey.key == key,
         )
     )
@@ -114,10 +125,11 @@ async def mark_completed(
         await db.flush()
 
 
-async def mark_failed(db: AsyncSession, merchant_id: str, key: str) -> None:
+async def mark_failed(db: AsyncSession, merchant_id: str, key: str, operation_type: str = "payment.create") -> None:
     result = await db.execute(
         select(IdempotencyKey).where(
             IdempotencyKey.merchant_id == merchant_id,
+            IdempotencyKey.operation_type == operation_type,
             IdempotencyKey.key == key,
         )
     )

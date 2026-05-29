@@ -3,16 +3,20 @@ from enum import Enum
 
 class TransactionState(str, Enum):
     CREATED = "CREATED"
+    PENDING = "PENDING"
     ROUTE_SELECTED = "ROUTE_SELECTED"
     AUTH_INITIATED = "AUTH_INITIATED"
+    AUTH_PENDING = "AUTH_PENDING"
     AUTHORISED = "AUTHORISED"
     AUTH_FAILED = "AUTH_FAILED"
     AUTH_TIMEOUT = "AUTH_TIMEOUT"
     AUTH_EXPIRED = "AUTH_EXPIRED"
     CAPTURE_INITIATED = "CAPTURE_INITIATED"
+    CAPTURE_PENDING = "CAPTURE_PENDING"
     CAPTURED = "CAPTURED"
     PARTIALLY_CAPTURED = "PARTIALLY_CAPTURED"
     CAPTURE_FAILED = "CAPTURE_FAILED"
+    SETTLEMENT_PENDING = "SETTLEMENT_PENDING"
     VOID_INITIATED = "VOID_INITIATED"
     VOIDED = "VOIDED"
     REFUND_INITIATED = "REFUND_INITIATED"
@@ -20,8 +24,15 @@ class TransactionState(str, Enum):
     PARTIALLY_REFUNDED = "PARTIALLY_REFUNDED"
     REFUND_FAILED = "REFUND_FAILED"
     SETTLED = "SETTLED"
+    SETTLEMENT_FAILED = "SETTLEMENT_FAILED"
     ABANDONED = "ABANDONED"
     FAILED = "FAILED"
+    WEBHOOK_PENDING = "WEBHOOK_PENDING"
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
+    MANUAL_REVIEW = "MANUAL_REVIEW"
+    DISPUTED = "DISPUTED"
+    CHARGEBACK = "CHARGEBACK"
+    REVERSED = "REVERSED"
     DISPUTE_OPENED = "DISPUTE_OPENED"
     DISPUTE_RESOLVED = "DISPUTE_RESOLVED"
     RECONCILIATION_MISMATCH = "RECONCILIATION_MISMATCH"
@@ -59,21 +70,34 @@ GATEWAY_METHODS: dict[GatewayName, list[PaymentMethod]] = {
 # Valid state transitions — the ONLY allowed moves
 VALID_TRANSITIONS: dict[TransactionState, list[TransactionState]] = {
     TransactionState.CREATED:             [TransactionState.ROUTE_SELECTED, TransactionState.ABANDONED],
+    TransactionState.PENDING:             [TransactionState.ROUTE_SELECTED, TransactionState.ABANDONED],
     TransactionState.ROUTE_SELECTED:      [TransactionState.AUTH_INITIATED, TransactionState.FAILED],
     TransactionState.AUTH_INITIATED:      [TransactionState.AUTHORISED, TransactionState.AUTH_FAILED,
                                            TransactionState.AUTH_TIMEOUT, TransactionState.CAPTURED,
-                                           TransactionState.AUTH_EXPIRED],
+                                           TransactionState.AUTH_PENDING, TransactionState.AUTH_EXPIRED,
+                                           TransactionState.WEBHOOK_PENDING],
+    TransactionState.AUTH_PENDING:        [TransactionState.AUTHORISED, TransactionState.AUTH_FAILED,
+                                           TransactionState.AUTH_TIMEOUT, TransactionState.AUTH_EXPIRED,
+                                           TransactionState.CAPTURED],
     TransactionState.AUTHORISED:          [TransactionState.CAPTURE_INITIATED, TransactionState.VOID_INITIATED,
                                            TransactionState.AUTH_EXPIRED, TransactionState.CAPTURED],
     TransactionState.AUTH_FAILED:         [TransactionState.ROUTE_SELECTED, TransactionState.FAILED],
     TransactionState.AUTH_TIMEOUT:        [TransactionState.ROUTE_SELECTED, TransactionState.AUTHORISED, TransactionState.FAILED],
     TransactionState.AUTH_EXPIRED:        [TransactionState.FAILED],
-    TransactionState.CAPTURE_INITIATED:   [TransactionState.CAPTURED, TransactionState.PARTIALLY_CAPTURED, TransactionState.CAPTURE_FAILED],
+    TransactionState.CAPTURE_INITIATED:   [TransactionState.CAPTURE_PENDING, TransactionState.CAPTURED, TransactionState.PARTIALLY_CAPTURED, TransactionState.CAPTURE_FAILED],
+    TransactionState.CAPTURE_PENDING:     [TransactionState.CAPTURED, TransactionState.PARTIALLY_CAPTURED, TransactionState.CAPTURE_FAILED],
     TransactionState.CAPTURED:            [TransactionState.REFUND_INITIATED, TransactionState.SETTLED,
-                                           TransactionState.DISPUTE_OPENED, TransactionState.RECONCILIATION_MISMATCH],
+                                           TransactionState.SETTLEMENT_PENDING, TransactionState.DISPUTE_OPENED,
+                                           TransactionState.DISPUTED, TransactionState.RECONCILIATION_MISMATCH,
+                                           TransactionState.RECONCILIATION_REQUIRED, TransactionState.MANUAL_REVIEW,
+                                           TransactionState.REVERSED],
     TransactionState.PARTIALLY_CAPTURED:  [TransactionState.CAPTURE_INITIATED, TransactionState.REFUND_INITIATED,
-                                           TransactionState.VOID_INITIATED, TransactionState.SETTLED],
+                                           TransactionState.VOID_INITIATED, TransactionState.SETTLED,
+                                           TransactionState.SETTLEMENT_PENDING],
     TransactionState.CAPTURE_FAILED:      [TransactionState.CAPTURE_INITIATED, TransactionState.VOID_INITIATED, TransactionState.FAILED],
+    TransactionState.SETTLEMENT_PENDING:  [TransactionState.SETTLED, TransactionState.SETTLEMENT_FAILED,
+                                           TransactionState.RECONCILIATION_REQUIRED],
+    TransactionState.SETTLEMENT_FAILED:   [TransactionState.RECONCILIATION_REQUIRED, TransactionState.MANUAL_REVIEW],
     TransactionState.VOID_INITIATED:      [TransactionState.VOIDED, TransactionState.FAILED],
     TransactionState.VOIDED:              [],
     TransactionState.REFUND_INITIATED:    [TransactionState.REFUNDED, TransactionState.PARTIALLY_REFUNDED, TransactionState.REFUND_FAILED],
@@ -81,9 +105,19 @@ VALID_TRANSITIONS: dict[TransactionState, list[TransactionState]] = {
     TransactionState.PARTIALLY_REFUNDED:  [TransactionState.REFUND_INITIATED, TransactionState.SETTLED],
     TransactionState.REFUND_FAILED:       [TransactionState.REFUND_INITIATED, TransactionState.FAILED],
     TransactionState.SETTLED:             [TransactionState.REFUND_INITIATED, TransactionState.DISPUTE_OPENED,
-                                           TransactionState.RECONCILIATION_MISMATCH],
+                                           TransactionState.DISPUTED, TransactionState.CHARGEBACK,
+                                           TransactionState.RECONCILIATION_MISMATCH, TransactionState.RECONCILIATION_REQUIRED],
     TransactionState.ABANDONED:           [],
     TransactionState.FAILED:              [],
+    TransactionState.WEBHOOK_PENDING:     [TransactionState.AUTHORISED, TransactionState.CAPTURED,
+                                           TransactionState.AUTH_FAILED, TransactionState.AUTH_EXPIRED],
+    TransactionState.RECONCILIATION_REQUIRED: [TransactionState.MANUAL_REVIEW, TransactionState.RECONCILIATION_MISMATCH,
+                                               TransactionState.CAPTURED, TransactionState.SETTLED, TransactionState.FAILED],
+    TransactionState.MANUAL_REVIEW:       [TransactionState.CAPTURED, TransactionState.SETTLED,
+                                           TransactionState.REFUNDED, TransactionState.FAILED, TransactionState.REVERSED],
+    TransactionState.DISPUTED:            [TransactionState.CHARGEBACK, TransactionState.DISPUTE_RESOLVED, TransactionState.REFUNDED],
+    TransactionState.CHARGEBACK:          [TransactionState.REVERSED, TransactionState.DISPUTE_RESOLVED],
+    TransactionState.REVERSED:            [],
     TransactionState.DISPUTE_OPENED:      [TransactionState.DISPUTE_RESOLVED, TransactionState.REFUNDED],
     TransactionState.DISPUTE_RESOLVED:    [],
     TransactionState.RECONCILIATION_MISMATCH: [TransactionState.CAPTURED, TransactionState.FAILED, TransactionState.REFUNDED],
@@ -91,7 +125,7 @@ VALID_TRANSITIONS: dict[TransactionState, list[TransactionState]] = {
 
 TERMINAL_STATES = {
     TransactionState.REFUNDED, TransactionState.FAILED, TransactionState.ABANDONED,
-    TransactionState.VOIDED, TransactionState.DISPUTE_RESOLVED,
+    TransactionState.VOIDED, TransactionState.DISPUTE_RESOLVED, TransactionState.REVERSED,
 }
 
 REFUNDABLE_STATES = {

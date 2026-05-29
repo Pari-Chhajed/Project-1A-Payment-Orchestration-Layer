@@ -90,3 +90,17 @@ def start_scheduler():
 
 def stop_scheduler():
     scheduler.shutdown(wait=False)
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    async def _main():
+        start_scheduler()
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            stop_scheduler()
+
+    asyncio.run(_main())

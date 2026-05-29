@@ -83,6 +83,22 @@ async def transition(
     from_state = TransactionState(txn.state)
     effective_trace = trace_id or txn.trace_id
 
+    if from_state == to_state:
+        audit = TransactionStateLog(
+            transaction_id=transaction_id,
+            from_state=from_state.value,
+            to_state=to_state.value,
+            event=f"DUPLICATE_{event}",
+            gateway_reference=gateway_reference,
+            gateway_response=_sanitize_gateway_response(gateway_response or {}),
+            meta={**(meta or {}), "idempotent_noop": True},
+            trace_id=effective_trace,
+            created_by=created_by,
+        )
+        db.add(audit)
+        await db.flush()
+        return from_state, to_state
+
     # ── Step 2: Validate transition BEFORE any DB change ──────
     if not is_valid_transition(from_state, to_state):
         # Log the rejected attempt to the audit trail
@@ -102,10 +118,6 @@ async def transition(
             from_state.value, to_state.value, transaction_id,
         )
         raise InvalidStateTransitionError(from_state, to_state)
-
-    # Idempotent: already in target state
-    if from_state == to_state:
-        return from_state, to_state
 
     # ── Step 3: Update the transaction ──────────────────────
     txn.state = to_state.value

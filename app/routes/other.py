@@ -4,7 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config.constants import GatewayName
@@ -280,7 +280,7 @@ health_router = APIRouter(tags=["Health"])
 async def health(db: AsyncSession = Depends(get_db)):
     import time
     try:
-        await db.execute(select(func.now()))
+        await db.execute(text("SELECT 1"))
         db_status = "connected"
     except Exception:
         db_status = "error"
@@ -298,6 +298,20 @@ async def health(db: AsyncSession = Depends(get_db)):
         "uptime_seconds": int(time.time()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@health_router.get("/api/v1/live")
+async def liveness():
+    return {"status": "alive", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+@health_router.get("/api/v1/ready")
+async def readiness(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("SELECT 1"))
+        return {"status": "ready", "database": "connected", "timestamp": datetime.now(timezone.utc).isoformat()}
+    except Exception:
+        return make_error_response("NOT_READY", "Database is not reachable", 503)
 
 
 @health_router.get("/")

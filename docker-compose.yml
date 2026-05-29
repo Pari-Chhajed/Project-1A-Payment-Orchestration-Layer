@@ -1,0 +1,106 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payflow
+      POSTGRES_USER: payflow
+      POSTGRES_PASSWORD: payflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payflow -d payflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pgbouncer:
+    image: edoburu/pgbouncer:1.22.1-p1
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: payflow
+      DB_PASSWORD: payflow
+      DB_NAME: payflow
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 500
+      DEFAULT_POOL_SIZE: 20
+    ports:
+      - "6432:5432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: &app_env
+      ENVIRONMENT: production
+      DATABASE_URL: postgresql+asyncpg://payflow:payflow@pgbouncer:5432/payflow
+      REDIS_URL: redis://redis:6379/0
+      API_KEY: test-api-key-12345
+      RAZORPAY_WEBHOOK_SECRET: razorpay_webhook_secret_test
+      STRIPE_WEBHOOK_SECRET: stripe_webhook_secret_test
+      PAYU_WEBHOOK_SECRET: payu_webhook_secret_test
+      UPI_WEBHOOK_SECRET: upi_webhook_secret_test
+      WEBHOOK_INLINE_PROCESSING: "false"
+      JSON_LOGS: "true"
+    depends_on:
+      pgbouncer:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  api:
+    build: .
+    environment:
+      <<: *app_env
+      SERVICE_ROLE: api
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.workers.worker"]
+    environment:
+      <<: *app_env
+      SERVICE_ROLE: worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    build: .
+    command: ["python", "-m", "app.workers.scheduler"]
+    environment:
+      <<: *app_env
+      SERVICE_ROLE: scheduler
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_data:
+  redis_data:

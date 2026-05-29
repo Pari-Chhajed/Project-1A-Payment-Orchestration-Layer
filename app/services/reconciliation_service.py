@@ -56,7 +56,7 @@ async def run(db: AsyncSession, triggered_by: str = "scheduled") -> dict:
                 Transaction.updated_at < stale_cutoff,
                 Transaction.gateway.is_not(None),
                 Transaction.gateway_reference.is_not(None),
-            ).limit(500)
+            ).limit(500).with_for_update(skip_locked=True)
         )
         stale_txns = result.scalars().all()
 
@@ -152,7 +152,7 @@ async def _reconcile_one(db: AsyncSession, txn: Transaction, run_id: str) -> dic
         else:
             try:
                 await sm.transition(
-                    db, txn.id, TransactionState.RECONCILIATION_MISMATCH,
+                    db, txn.id, TransactionState.RECONCILIATION_REQUIRED,
                     event="CRITICAL_RECONCILIATION_ANOMALY",
                     meta={"run_id": run_id, "requires_manual": True},
                     created_by="reconciliation_engine",

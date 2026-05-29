@@ -21,7 +21,7 @@ from app.config.constants import (
     GatewayName, PaymentMethod, TransactionState, REFUNDABLE_STATES,
 )
 from app.models.models import (
-    GatewayRoute, Refund, Transaction,
+    GatewayAttempt, GatewayRoute, PaymentAttempt, Refund, Transaction,
 )
 from app.services import (
     circuit_breaker as cb_svc,
@@ -167,18 +167,32 @@ async def create_payment(
             created_by="payment_service",
             trace_id=trace_id,
         )
+        payment_attempt = PaymentAttempt(
+            transaction_id=txn_id,
+            operation_type="payment.create",
+            attempt_number=1,
+            idempotency_key=idempotency_key,
+            status="PROCESSING",
+            amount_paise=amount_paise,
+            currency=currency,
+            trace_id=trace_id,
+        )
+        db.add(payment_attempt)
+        await db.flush()
 
         # Call gateway with failover
         await _call_gateway_with_failover(
             db, txn_id, selected_gateway, payment_method, amount_paise,
             currency, customer, idempotency_key, trace_id,
-            [selected_gateway], mock_response, mock_delay_ms,
+            [selected_gateway], mock_response, mock_delay_ms, payment_attempt.id,
         )
 
         await db.commit()
         txn = await _get_txn(db, txn_id)
         response_body = _txn_to_dict(txn)
         await idem_svc.mark_completed(db, merchant_id, idempotency_key, txn_id, 201, response_body)
+        payment_attempt.status = "COMPLETED"
+        payment_attempt.completed_at = datetime.now(timezone.utc)
         await db.commit()
         return response_body
 
@@ -217,6 +231,7 @@ async def _call_gateway_with_failover(
     tried: list[GatewayName],
     mock_response: str | None,
     mock_delay_ms: int | None,
+    payment_attempt_id: str | None = None,
 ) -> None:
     timeout_sec = gw.GATEWAY_TIMEOUT.get(gateway, 30)
     authorise_fn = gw.AUTHORISE_FN[gateway]
@@ -228,6 +243,20 @@ async def _call_gateway_with_failover(
         created_by="payment_service",
         trace_id=trace_id,
     )
+    await db.commit()
+
+    gw_attempt = None
+    if payment_attempt_id:
+        gw_attempt = GatewayAttempt(
+            payment_attempt_id=payment_attempt_id,
+            transaction_id=txn_id,
+            gateway=gateway.value,
+            attempt_number=len(tried),
+            status="PROCESSING",
+            request_hash=f"{txn_id}:{gateway.value}:{amount_paise}:{currency}",
+        )
+        db.add(gw_attempt)
+        await db.commit()
 
     start = asyncio.get_event_loop().time()
     try:
@@ -242,6 +271,14 @@ async def _call_gateway_with_failover(
         latency_ms = int((asyncio.get_event_loop().time() - start) * 1000)
 
         if not response.success:
+            if gw_attempt:
+                gw_attempt.status = "FAILED"
+                gw_attempt.error_code = response.error_code
+                gw_attempt.error_message = response.error_message
+                gw_attempt.response_body = response.raw_response
+                gw_attempt.latency_ms = latency_ms
+                gw_attempt.completed_at = datetime.now(timezone.utc)
+                await db.commit()
             await cb_svc.record_failure(db, gateway)
             await gateway_router.record_metric(db, gateway, False, latency_ms)
 
@@ -249,7 +286,7 @@ async def _call_gateway_with_failover(
                 return await _attempt_failover(
                     db, txn_id, gateway, payment_method, amount_paise,
                     currency, customer, idempotency_key, trace_id, tried,
-                    mock_response, mock_delay_ms,
+                    mock_response, mock_delay_ms, payment_attempt_id,
                 )
 
             await sm.transition(
@@ -265,11 +302,19 @@ async def _call_gateway_with_failover(
         # SUCCESS
         await cb_svc.record_success(db, gateway)
         await gateway_router.record_metric(db, gateway, True, latency_ms)
+        if gw_attempt:
+            gw_attempt.status = "COMPLETED"
+            gw_attempt.gateway_reference = response.gateway_payment_id
+            gw_attempt.gateway_order_id = response.gateway_order_id
+            gw_attempt.response_body = response.raw_response
+            gw_attempt.latency_ms = latency_ms
+            gw_attempt.completed_at = datetime.now(timezone.utc)
 
         txn = await _get_txn(db, txn_id)
         txn.gateway_reference = response.gateway_payment_id
         txn.gateway_order_id = response.gateway_order_id
         txn.auth_hold_expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+        txn.hold_amount_paise = 0 if gateway == GatewayName.UPI else amount_paise
         await db.flush()
 
         # UPI: instant payment → jump to CAPTURED
@@ -297,6 +342,13 @@ async def _call_gateway_with_failover(
         latency_ms = int((asyncio.get_event_loop().time() - start) * 1000)
         await cb_svc.record_failure(db, gateway)
         await gateway_router.record_metric(db, gateway, False, latency_ms)
+        if gw_attempt:
+            gw_attempt.status = "TIMEOUT"
+            gw_attempt.error_code = "TIMEOUT"
+            gw_attempt.error_message = f"Gateway timed out after {timeout_sec}s"
+            gw_attempt.latency_ms = latency_ms
+            gw_attempt.completed_at = datetime.now(timezone.utc)
+            await db.commit()
         logger.warning("Gateway %s timed out after %ds — initiating failover", gateway.value, timeout_sec)
 
         await sm.transition(
@@ -311,14 +363,33 @@ async def _call_gateway_with_failover(
             return await _attempt_failover(
                 db, txn_id, gateway, payment_method, amount_paise,
                 currency, customer, idempotency_key, trace_id, tried,
-                mock_response, mock_delay_ms,
+                mock_response, mock_delay_ms, payment_attempt_id,
             )
         raise ValueError("ALL_GATEWAYS_FAILED:All gateways timed out")
+    except (ConnectionError, OSError) as exc:
+        latency_ms = int((asyncio.get_event_loop().time() - start) * 1000)
+        await cb_svc.record_failure(db, gateway)
+        await gateway_router.record_metric(db, gateway, False, latency_ms)
+        if gw_attempt:
+            gw_attempt.status = "FAILED"
+            gw_attempt.error_code = "GATEWAY_UNREACHABLE"
+            gw_attempt.error_message = str(exc)
+            gw_attempt.latency_ms = latency_ms
+            gw_attempt.completed_at = datetime.now(timezone.utc)
+            await db.commit()
+        if len(tried) < 4:
+            return await _attempt_failover(
+                db, txn_id, gateway, payment_method, amount_paise,
+                currency, customer, idempotency_key, trace_id, tried,
+                mock_response, mock_delay_ms, payment_attempt_id,
+            )
+        raise ValueError("ALL_GATEWAYS_FAILED:All gateways unreachable") from exc
 
 
 async def _attempt_failover(
     db, txn_id, failed_gw, payment_method, amount_paise, currency,
     customer, idempotency_key, trace_id, tried, mock_response, mock_delay_ms,
+    payment_attempt_id=None,
 ):
     next_gw = await gateway_router.get_failover_gateway(
         db, payment_method, amount_paise, trace_id, tried
@@ -347,7 +418,7 @@ async def _attempt_failover(
     return await _call_gateway_with_failover(
         db, txn_id, next_gw, payment_method, amount_paise, currency,
         customer, idempotency_key, trace_id, tried + [next_gw],
-        mock_response, mock_delay_ms,
+        mock_response, mock_delay_ms, payment_attempt_id,
     )
 
 
@@ -364,6 +435,11 @@ async def capture_payment(
 ) -> dict:
     txn = await _get_txn(db, txn_id)
     capture_amount = amount_paise or txn.amount_paise
+    if capture_amount <= 0:
+        raise ValueError("Capture amount must be greater than 0")
+    remaining_hold = max((txn.amount_paise or 0) - (txn.captured_amount_paise or 0), 0)
+    if capture_amount > remaining_hold:
+        raise ValueError(f"CAPTURE_EXCEEDS_HOLD:Max capturable is {remaining_hold} paise")
     is_partial = capture_amount < txn.amount_paise
     gateway = GatewayName(txn.gateway)
     capture_fn = gw.CAPTURE_FN[gateway]
@@ -383,12 +459,14 @@ async def capture_payment(
             resp = await capture_fn(txn.gateway_reference, capture_amount, mock_response)
             if resp.success:
                 new_state = TransactionState.PARTIALLY_CAPTURED if is_partial else TransactionState.CAPTURED
+                txn.hold_amount_paise = max((txn.amount_paise - (txn.captured_amount_paise or 0) - capture_amount), 0)
                 await sm.transition(
                     db, txn_id, new_state,
                     event="PARTIAL_CAPTURE_SUCCESS" if is_partial else "GATEWAY_CAPTURE_SUCCESS",
                     gateway_reference=txn.gateway_reference,
                     gateway_response=resp.raw_response,
-                    captured_amount_paise=capture_amount,
+                    captured_amount_paise=(txn.captured_amount_paise or 0) + capture_amount,
+                    meta={"remaining_hold_paise": txn.hold_amount_paise, "attempt": attempt + 1},
                     created_by="payment_service",
                     trace_id=txn.trace_id,
                 )

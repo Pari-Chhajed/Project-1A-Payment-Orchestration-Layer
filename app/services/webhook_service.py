@@ -9,6 +9,7 @@ Webhook Processing Pipeline
 """
 import json
 import logging
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -134,6 +135,15 @@ async def _process(
             raise WebhookValidationError(
                 f"Amount mismatch: expected {txn.amount_paise} paise, got {wh_amount}"
             )
+        wh_currency = _extract_currency(payload_data, gateway)
+        if wh_currency and wh_currency.upper() != txn.currency.upper():
+            await _log_security_event(
+                db, "WEBHOOK_CURRENCY_MISMATCH", gateway.value, source_ip, raw_body,
+                {"transaction_id": txn.id, "expected": txn.currency, "got": wh_currency},
+            )
+            raise WebhookValidationError(
+                f"Currency mismatch: expected {txn.currency}, got {wh_currency}"
+            )
 
     # ── 5. State transition ───────────────────────────────────────
     transition_info = event_map.get(event_type)
@@ -187,10 +197,48 @@ def _extract_amount(payload: dict, gateway: GatewayName) -> int | None:
         if gateway in (GatewayName.PAYU, GatewayName.UPI):
             amt = payload.get("amount")
             if amt:
-                return round(float(amt) * 100)
-    except Exception:
+                return int((Decimal(str(amt)) * Decimal("100")).quantize(Decimal("1")))
+    except (InvalidOperation, ValueError, TypeError):
         pass
     return None
+
+
+def _extract_currency(payload: dict, gateway: GatewayName) -> str | None:
+    if gateway == GatewayName.STRIPE:
+        currency = payload.get("currency")
+        return currency.upper() if isinstance(currency, str) else None
+    currency = payload.get("currency")
+    return currency.upper() if isinstance(currency, str) else None
+
+
+def parse_webhook_identity(gateway: GatewayName, raw_body: str) -> tuple[str, dict]:
+    if gateway == GatewayName.PAYU:
+        payload = dict(p.split("=", 1) for p in raw_body.split("&") if "=" in p)
+        event_id = f"{payload.get('txnid', '')}_{payload.get('status', 'unknown')}"
+        return event_id, payload
+    payload = json.loads(raw_body)
+    if gateway == GatewayName.RAZORPAY:
+        event_type = payload.get("event", "")
+        entity = (payload.get("payload") or {}).get("payment", {}).get("entity") or \
+                 (payload.get("payload") or {}).get("refund", {}).get("entity") or {}
+        return f"{event_type}_{entity.get('id', '')}", payload
+    if gateway == GatewayName.STRIPE:
+        return payload.get("id", ""), payload
+    gateway_ref = payload.get("txnRefNum") or payload.get("upiTransactionId", "")
+    return f"{gateway_ref}_{payload.get('status', 'UNKNOWN')}", payload
+
+
+async def process_queued_webhook(db: AsyncSession, gateway: str, raw_body: str, signature: str, source_ip: str) -> dict:
+    gw = GatewayName(gateway)
+    if gw == GatewayName.RAZORPAY:
+        return await process_razorpay(db, raw_body, signature, source_ip)
+    if gw == GatewayName.STRIPE:
+        return await process_stripe(db, raw_body, signature, source_ip)
+    if gw == GatewayName.PAYU:
+        return await process_payu(db, raw_body, source_ip)
+    if gw == GatewayName.UPI:
+        return await process_upi(db, raw_body, signature, source_ip)
+    raise WebhookValidationError(f"Unsupported gateway {gateway}")
 
 
 # ─────────────────────────────────────────────────────────────────
