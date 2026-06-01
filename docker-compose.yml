@@ -29,7 +29,7 @@ services:
       retries: 10
 
   pgbouncer:
-    image: edoburu/pgbouncer:1.22.1-p1
+    image: edoburu/pgbouncer:latest
     environment:
       DB_HOST: postgres
       DB_PORT: 5432
@@ -50,7 +50,7 @@ services:
     command: ["alembic", "upgrade", "head"]
     environment: &app_env
       ENVIRONMENT: production
-      DATABASE_URL: postgresql+asyncpg://payflow:payflow@pgbouncer:5432/payflow
+      DATABASE_URL: postgresql+asyncpg://payflow:payflow@postgres:5432/payflow
       REDIS_URL: redis://redis:6379/0
       API_KEY: test-api-key-12345
       RAZORPAY_WEBHOOK_SECRET: razorpay_webhook_secret_test
